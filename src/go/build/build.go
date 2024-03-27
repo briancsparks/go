@@ -1061,7 +1061,7 @@ Found:
 
 func fileListForExt(p *Package, ext string) *[]string {
 	switch ext {
-	case ".c":
+  case ".c", ".zig":      // BBB BCS: hacking golang
 		return &p.CFiles
 	case ".cc", ".cpp", ".cxx":
 		return &p.CXXFiles
