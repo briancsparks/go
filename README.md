@@ -15,6 +15,16 @@ He also pointed out a few other things to checkout in this regard:
 - [Building SQLite with CGO...](https://zig.news/kristoff/building-sqlite-with-cgo-for-every-os-4cic)
 - [Cross Compilation 'Just Works' with Zig](https://dev.to/kristoff/zig-makes-go-cross-compilation-just-work-29ho)
 
+After re-compiling Go with his 'look for zig files' hack, he recompiled Go, and
+then had a folder with a `hello.zig` file:
+
+```shell
+CGO_ENABLED=1 CC="zig cc" ~/go-src/bin/go build
+```
+
+So, Go was building a single-file project, but the source code was in Zig. And
+it worked!!!
+
 # Back to Your _'The Go Programming Language'_
 
 Go is an open source programming language that makes it easy to build simple,
