@@ -1,4 +1,21 @@
-# The Go Programming Language
+# The Go Programming Language - BCS Hacked version
+
+Loris Cro (the Zig guy) has a video where he does this:
+
+- Hack Go source code to look for ".zig" files in the same execution flow as
+  it looks for ".c" files. (So, the Go build process is compiling any .zig
+  files it finds like they are "C".
+  - Which doesn't work, of course.
+- But! When he changes `CC="zig cc"` it actually works!!!!!
+
+He also pointed out a few other things to checkout in this regard:
+
+- [Maintain it with Zig](https://kristoff.it/blog/maintain-it-with-zig/)
+- ['zig cc': A powerful drop-in](https://andrewkelley.me/post/zig-cc-powerful-drop-in-replacement-gcc-clang.html)
+- [Building SQLite with CGO...](https://zig.news/kristoff/building-sqlite-with-cgo-for-every-os-4cic)
+- [Cross Compilation 'Just Works' with Zig](https://dev.to/kristoff/zig-makes-go-cross-compilation-just-work-29ho)
+
+# Back to Your _'The Go Programming Language'_
 
 Go is an open source programming language that makes it easy to build simple,
 reliable, and efficient software.
