@@ -1208,6 +1208,17 @@ func casGToWaiting(gp *g, old uint32, reason waitReason) {
 	casgstatus(gp, old, _Gwaiting)
 }
 
+// casGToWaitingForGC transitions gp from old to _Gwaiting, and sets the wait reason.
+// The wait reason must be a valid isWaitingForGC wait reason.
+//
+// Use this over casgstatus when possible to ensure that a waitreason is set.
+func casGToWaitingForGC(gp *g, old uint32, reason waitReason) {
+	if !reason.isWaitingForGC() {
+		throw("casGToWaitingForGC with non-isWaitingForGC wait reason")
+	}
+	casGToWaiting(gp, old, reason)
+}
+
 // casgstatus(gp, oldstatus, Gcopystack), assuming oldstatus is Gwaiting or Grunnable.
 // Returns old status. Cannot call casgstatus directly, because we are racing with an
 // async wakeup that might come in from netpoll. If we see Gwaiting from the readgstatus,
@@ -1311,8 +1322,10 @@ var stwReasonStrings = [...]string{
 // worldStop provides context from the stop-the-world required by the
 // start-the-world.
 type worldStop struct {
-	reason stwReason
-	start  int64
+	reason           stwReason
+	startedStopping  int64
+	finishedStopping int64
+	stoppingCPUTime  int64
 }
 
 // Temporary variable for stopTheWorld, when it can't write to the stack.
@@ -1356,7 +1369,7 @@ func stopTheWorld(reason stwReason) worldStop {
 		// N.B. The execution tracer is not aware of this status
 		// transition and handles it specially based on the
 		// wait reason.
-		casGToWaiting(gp, _Grunning, waitReasonStoppingTheWorld)
+		casGToWaitingForGC(gp, _Grunning, waitReasonStoppingTheWorld)
 		stopTheWorldContext = stopTheWorldWithSema(reason) // avoid write to stack
 		casgstatus(gp, _Gwaiting, _Grunning)
 	})
@@ -1468,6 +1481,7 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 	preemptall()
 	// stop current P
 	gp.m.p.ptr().status = _Pgcstop // Pgcstop is only diagnostic.
+	gp.m.p.ptr().gcStopTime = start
 	sched.stopwait--
 	// try to retake all P's in Psyscall status
 	trace = traceAcquire()
@@ -1479,6 +1493,7 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 				trace.ProcSteal(pp, false)
 			}
 			pp.syscalltick++
+			pp.gcStopTime = nanotime()
 			sched.stopwait--
 		}
 	}
@@ -1494,6 +1509,7 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 			break
 		}
 		pp.status = _Pgcstop
+		pp.gcStopTime = nanotime()
 		sched.stopwait--
 	}
 	wait := sched.stopwait > 0
@@ -1511,14 +1527,19 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 		}
 	}
 
-	startTime := nanotime() - start
+	finish := nanotime()
+	startTime := finish - start
 	if reason.isGC() {
 		sched.stwStoppingTimeGC.record(startTime)
 	} else {
 		sched.stwStoppingTimeOther.record(startTime)
 	}
 
-	// sanity checks
+	// Double-check we actually stopped everything, and all the invariants hold.
+	// Also accumulate all the time spent by each P in _Pgcstop up to the point
+	// where everything was stopped. This will be accumulated into the total pause
+	// CPU time by the caller.
+	stoppingCPUTime := int64(0)
 	bad := ""
 	if sched.stopwait != 0 {
 		bad = "stopTheWorld: not stopped (stopwait != 0)"
@@ -1527,6 +1548,11 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 			if pp.status != _Pgcstop {
 				bad = "stopTheWorld: not stopped (status != _Pgcstop)"
 			}
+			if pp.gcStopTime == 0 && bad == "" {
+				bad = "stopTheWorld: broken CPU time accounting"
+			}
+			stoppingCPUTime += finish - pp.gcStopTime
+			pp.gcStopTime = 0
 		}
 	}
 	if freezing.Load() {
@@ -1543,7 +1569,12 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 
 	worldStopped()
 
-	return worldStop{reason: reason, start: start}
+	return worldStop{
+		reason:           reason,
+		startedStopping:  start,
+		finishedStopping: finish,
+		stoppingCPUTime:  stoppingCPUTime,
+	}
 }
 
 // reason is the same STW reason passed to stopTheWorld. start is the start
@@ -1599,7 +1630,7 @@ func startTheWorldWithSema(now int64, w worldStop) int64 {
 	if now == 0 {
 		now = nanotime()
 	}
-	totalTime := now - w.start
+	totalTime := now - w.startedStopping
 	if w.reason.isGC() {
 		sched.stwTotalTimeGC.record(totalTime)
 	} else {
@@ -1903,7 +1934,7 @@ func forEachP(reason waitReason, fn func(*p)) {
 		// N.B. The execution tracer is not aware of this status
 		// transition and handles it specially based on the
 		// wait reason.
-		casGToWaiting(gp, _Grunning, reason)
+		casGToWaitingForGC(gp, _Grunning, reason)
 		forEachPInternal(fn)
 		casgstatus(gp, _Gwaiting, _Grunning)
 	})
@@ -2932,6 +2963,7 @@ func handoffp(pp *p) {
 	lock(&sched.lock)
 	if sched.gcwaiting.Load() {
 		pp.status = _Pgcstop
+		pp.gcStopTime = nanotime()
 		sched.stopwait--
 		if sched.stopwait == 0 {
 			notewakeup(&sched.stopnote)
@@ -3074,6 +3106,7 @@ func gcstopm() {
 	pp := releasep()
 	lock(&sched.lock)
 	pp.status = _Pgcstop
+	pp.gcStopTime = nanotime()
 	sched.stopwait--
 	if sched.stopwait == 0 {
 		notewakeup(&sched.stopnote)
@@ -3961,11 +3994,16 @@ func park_m(gp *g) {
 
 	trace := traceAcquire()
 
+	if trace.ok() {
+		// Trace the event before the transition. It may take a
+		// stack trace, but we won't own the stack after the
+		// transition anymore.
+		trace.GoPark(mp.waitTraceBlockReason, mp.waitTraceSkip)
+	}
 	// N.B. Not using casGToWaiting here because the waitreason is
 	// set by park_m's caller.
 	casgstatus(gp, _Grunning, _Gwaiting)
 	if trace.ok() {
-		trace.GoPark(mp.waitTraceBlockReason, mp.waitTraceSkip)
 		traceRelease(trace)
 	}
 
@@ -3995,13 +4033,18 @@ func goschedImpl(gp *g, preempted bool) {
 		dumpgstatus(gp)
 		throw("bad g status")
 	}
-	casgstatus(gp, _Grunning, _Grunnable)
 	if trace.ok() {
+		// Trace the event before the transition. It may take a
+		// stack trace, but we won't own the stack after the
+		// transition anymore.
 		if preempted {
 			trace.GoPreempt()
 		} else {
 			trace.GoSched()
 		}
+	}
+	casgstatus(gp, _Grunning, _Grunnable)
+	if trace.ok() {
 		traceRelease(trace)
 	}
 
@@ -4104,9 +4147,14 @@ func goyield() {
 func goyield_m(gp *g) {
 	trace := traceAcquire()
 	pp := gp.m.p.ptr()
+	if trace.ok() {
+		// Trace the event before the transition. It may take a
+		// stack trace, but we won't own the stack after the
+		// transition anymore.
+		trace.GoPreempt()
+	}
 	casgstatus(gp, _Grunning, _Grunnable)
 	if trace.ok() {
-		trace.GoPreempt()
 		traceRelease(trace)
 	}
 	dropg()
@@ -4376,6 +4424,7 @@ func entersyscall_gcwait() {
 			}
 			traceRelease(trace)
 		}
+		pp.gcStopTime = nanotime()
 		pp.syscalltick++
 		if sched.stopwait--; sched.stopwait == 0 {
 			notewakeup(&sched.stopnote)
@@ -5613,7 +5662,7 @@ func procresize(nprocs int32) *p {
 			if trace.ok() {
 				// Pretend that we were descheduled
 				// and then scheduled again to keep
-				// the trace sane.
+				// the trace consistent.
 				trace.GoSched()
 				trace.ProcStop(gp.m.p.ptr())
 				traceRelease(trace)
